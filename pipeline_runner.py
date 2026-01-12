@@ -187,7 +187,7 @@ class PipelineRunner:
                 
                 # Format choices for selection
                 choices = [
-                    f"{v['buildNumber']} ({v['result'] or v['status']}) - {v['sourceBranch']} [{v['id']}]"
+                    f"{v['buildNumber']} ({v['result'] or v['status']}) - {v['sourceBranch']}"
                     for v in versions
                 ]
                 choices.insert(0, "[Use default version]")
@@ -198,9 +198,9 @@ class PipelineRunner:
                 )
                 
                 if selected and selected != "[Use default version]":
-                    # Extract build id from selection
-                    build_id = selected.split('[')[-1].rstrip(']')
-                    resource_versions[alias] = build_id
+                    # Extract build number from selection (it's the first part before the space)
+                    build_number = selected.split(' ')[0]
+                    resource_versions[alias] = build_number
                     
             except Exception as e:
                 print(f"  Could not get versions for {alias}: {e}")
