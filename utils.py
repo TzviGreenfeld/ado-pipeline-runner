@@ -47,3 +47,29 @@ def checkbox_filter(
         if invert_selections:
             selected = [item for item in items if item not in selected]
         return selected
+
+
+def select_from_list(
+    items: List[str],
+    message: str = "Select an item:",
+) -> str:
+    """
+    Show a selection interface and return the selected item.
+    
+    Args:
+        items: List of strings to choose from
+        message: Prompt message to display
+    
+    Returns:
+        Selected item string, or None if cancelled
+    """
+    if not items:
+        typer.echo("No items to select from!")
+        return None
+    
+    selected = questionary.select(
+        message,
+        choices=items,
+    ).ask()
+    
+    return selected

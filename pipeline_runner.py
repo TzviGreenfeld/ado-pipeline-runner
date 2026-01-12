@@ -6,9 +6,9 @@ from typing import List, Dict, Optional
 from urllib.parse import urlparse, parse_qs
 from azure.devops.connection import Connection
 from msrest.authentication import BasicAuthentication
-from azure.devops.v7_0.pipelines.models import RunPipelineParameters
+from azure.devops.v7_0.pipelines.models import RunPipelineParameters, RunResourcesParameters, PipelineResourceParameters
 
-from utils import checkbox_filter
+from utils import checkbox_filter, select_from_list
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -71,6 +71,142 @@ class PipelineRunner:
         
         return stages
     
+    def get_pipeline_resources(self, url: str) -> List[Dict]:
+        """Get pipeline resources (other pipelines this pipeline depends on) from a pipeline definition"""
+        url_info = self._parse_url(url)
+        definition_id = int(url_info['query_params'].get("definitionId", [0])[0])
+        
+        connection = self._get_connection(url_info['organization_url'])
+        pipelines_client = connection.clients.get_pipelines_client()
+        
+        # Preview to get the YAML
+        run_parameters = RunPipelineParameters()
+        preview = pipelines_client.preview(
+            run_parameters=run_parameters,
+            project=url_info['project'],
+            pipeline_id=definition_id
+        )
+        
+        # Parse YAML to extract pipeline resources
+        pipeline_yaml = yaml.safe_load(preview.final_yaml)
+        resources = []
+        
+        if 'resources' in pipeline_yaml and 'pipelines' in pipeline_yaml['resources']:
+            for pipeline_res in pipeline_yaml['resources']['pipelines']:
+                resource_info = {
+                    'alias': pipeline_res.get('pipeline'),  # The alias used to reference this resource
+                    'source': pipeline_res.get('source'),   # The actual pipeline name
+                    'project': pipeline_res.get('project', url_info['project']),  # Project (defaults to current)
+                }
+                resources.append(resource_info)
+        
+        return resources
+    
+    def get_pipeline_resource_versions(self, url: str, resource_alias: str, top: int = 20) -> List[Dict]:
+        """
+        Get available versions (builds) for a pipeline resource.
+        
+        Args:
+            url: Pipeline definition URL
+            resource_alias: The alias of the pipeline resource
+            top: Number of recent builds to return
+            
+        Returns:
+            List of available builds with id, buildNumber, status, and result
+        """
+        url_info = self._parse_url(url)
+        
+        # First get the resource info to find the source pipeline
+        resources = self.get_pipeline_resources(url)
+        resource = next((r for r in resources if r['alias'] == resource_alias), None)
+        
+        if not resource:
+            raise ValueError(f"Resource '{resource_alias}' not found in pipeline")
+        
+        connection = self._get_connection(url_info['organization_url'])
+        build_client = connection.clients.get_build_client()
+        
+        # Get the pipeline definition by name
+        definitions = build_client.get_definitions(
+            project=resource['project'],
+            name=resource['source']
+        )
+        
+        if not definitions:
+            raise ValueError(f"Pipeline '{resource['source']}' not found in project '{resource['project']}'")
+        
+        definition_id = definitions[0].id
+        
+        # Get recent builds for this pipeline
+        builds = build_client.get_builds(
+            project=resource['project'],
+            definitions=[definition_id],
+            top=top
+        )
+        
+        return [
+            {
+                'id': build.id,
+                'buildNumber': build.build_number,
+                'status': build.status,
+                'result': build.result,
+                'sourceBranch': build.source_branch,
+                'finishTime': str(build.finish_time) if build.finish_time else None
+            }
+            for build in builds
+        ]
+    
+    def select_resource_versions(self, url: str) -> Optional[Dict[str, str]]:
+        """
+        Interactive method to select versions for pipeline resources.
+        
+        Returns:
+            Dictionary mapping resource alias to version (build id), or None if no resources
+        """
+        resources = self.get_pipeline_resources(url)
+        
+        if not resources:
+            return None
+        
+        print(f"\nFound {len(resources)} pipeline resource(s)")
+        
+        resource_versions = {}
+        
+        for resource in resources:
+            alias = resource['alias']
+            source = resource['source']
+            
+            print(f"\nResource: {alias} (source: {source})")
+            
+            try:
+                versions = self.get_pipeline_resource_versions(url, alias)
+                
+                if not versions:
+                    print(f"  No builds found for {alias}")
+                    continue
+                
+                # Format choices for selection
+                choices = [
+                    f"{v['buildNumber']} ({v['result'] or v['status']}) - {v['sourceBranch']} [{v['id']}]"
+                    for v in versions
+                ]
+                choices.insert(0, "[Use default version]")
+                
+                selected = select_from_list(
+                    items=choices,
+                    message=f"Select version for '{alias}':"
+                )
+                
+                if selected and selected != "[Use default version]":
+                    # Extract build id from selection
+                    build_id = selected.split('[')[-1].rstrip(']')
+                    resource_versions[alias] = build_id
+                    
+            except Exception as e:
+                print(f"  Could not get versions for {alias}: {e}")
+        
+        return resource_versions if resource_versions else None
+
     def get_pipeline_status(self, url: str) -> Dict:
         """
         Given an Azure DevOps pipeline run URL, return its state and result.
@@ -93,10 +229,22 @@ class PipelineRunner:
             "result": build.result   # "succeeded", "failed", ...
         }
     
-    def run_pipeline(self, url: str, stages_to_skip: Optional[List[str]] = None) -> Dict:
+    def run_pipeline(
+        self, 
+        url: str, 
+        stages_to_skip: Optional[List[str]] = None,
+        resource_versions: Optional[Dict[str, str]] = None,
+        interactive: bool = True
+    ) -> Dict:
         """
         Given an Azure DevOps pipeline definition URL, queue a new build.
         Example URL: https://dev.azure.com/org/project/_build?definitionId=123
+        
+        Args:
+            url: Pipeline definition URL
+            stages_to_skip: List of stages to skip (if None and interactive, prompts user)
+            resource_versions: Dict mapping resource alias to version/build ID
+            interactive: If True, prompts user for stages and resources when not provided
         """
         url_info = self._parse_url(url)
         definition_id = int(url_info['query_params'].get("definitionId", [0])[0])
@@ -105,14 +253,30 @@ class PipelineRunner:
         pipelines_client = connection.clients.get_pipelines_client()
         
         # Configure which stages to skip
-        if stages_to_skip is None:
+        if stages_to_skip is None and interactive:
             stages_to_skip = checkbox_filter(
                 items=self.get_pipeline_stages(url),
                 message="pick the stages to run",
                 invert_selections=True
             )
         
-        run_parameters = RunPipelineParameters(stages_to_skip=stages_to_skip)
+        # Configure resource versions
+        if resource_versions is None and interactive:
+            resource_versions = self.select_resource_versions(url)
+        
+        # Build resources parameter if resource versions specified
+        resources_param = None
+        if resource_versions:
+            pipelines_resources = {
+                alias: PipelineResourceParameters(version=version)
+                for alias, version in resource_versions.items()
+            }
+            resources_param = RunResourcesParameters(pipelines=pipelines_resources)
+        
+        run_parameters = RunPipelineParameters(
+            stages_to_skip=stages_to_skip or [],
+            resources=resources_param
+        )
         
         # Run the pipeline
         run = pipelines_client.run_pipeline(
