@@ -207,6 +207,49 @@ class PipelineRunner:
         
         return resource_versions if resource_versions else None
 
+    def _get_resource_versions_from_build(self, build_url: str, trigger_url: str) -> Optional[Dict[str, str]]:
+        """
+        Get resource versions for the trigger pipeline based on the monitored build.
+        
+        Matches the monitored build to any pipeline resources in the trigger pipeline
+        and returns the build number to use as the version.
+        
+        Args:
+            build_url: URL of the completed build (the one being monitored)
+            trigger_url: URL of the pipeline definition to trigger
+            
+        Returns:
+            Dictionary mapping resource alias to build number, or None if no match
+        """
+        # Get info about the monitored build
+        build_url_info = self._parse_url(build_url)
+        build_id = int(build_url_info['query_params'].get("buildId", [0])[0])
+        
+        connection = self._get_connection(build_url_info['organization_url'])
+        build_client = connection.clients.get_build_client()
+        
+        # Get the build details
+        build = build_client.get_build(project=build_url_info['project'], build_id=build_id)
+        if not build:
+            return None
+        
+        monitored_pipeline_name = build.definition.name
+        monitored_build_number = build.build_number
+        
+        # Get the trigger pipeline's resources
+        resources = self.get_pipeline_resources(trigger_url)
+        if not resources:
+            return None
+        
+        # Find matching resource
+        resource_versions = {}
+        for resource in resources:
+            if resource['source'] == monitored_pipeline_name:
+                resource_versions[resource['alias']] = monitored_build_number
+                print(f"Using build {monitored_build_number} for resource '{resource['alias']}'")
+        
+        return resource_versions if resource_versions else None
+
     def get_pipeline_status(self, url: str) -> Dict:
         """
         Given an Azure DevOps pipeline run URL, return its state and result.
@@ -331,7 +374,15 @@ class PipelineRunner:
                         if status['result'] == 'succeeded':
                             print("Triggering second pipeline with pre-selected stages...")
                             
-                            trigger_result = self.run_pipeline(trigger_url, stages_to_skip=stages_to_skip)
+                            # Get the build number from the monitored pipeline to use as resource version
+                            resource_versions = self._get_resource_versions_from_build(monitor_url, trigger_url)
+                            
+                            trigger_result = self.run_pipeline(
+                                trigger_url, 
+                                stages_to_skip=stages_to_skip,
+                                resource_versions=resource_versions,
+                                interactive=False
+                            )
                             print(f"Successfully triggered pipeline {trigger_result['build_id']}")
                             print(f"URL: {trigger_result['url']}")
                         else:
