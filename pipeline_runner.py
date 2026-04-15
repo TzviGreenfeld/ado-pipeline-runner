@@ -374,13 +374,10 @@ class PipelineRunner:
                         if status['result'] == 'succeeded':
                             print("Triggering second pipeline with pre-selected stages...")
                             
-                            # Get the build number from the monitored pipeline to use as resource version
-                            resource_versions = self._get_resource_versions_from_build(monitor_url, trigger_url)
-                            
                             trigger_result = self.run_pipeline(
                                 trigger_url, 
                                 stages_to_skip=stages_to_skip,
-                                resource_versions=resource_versions,
+                                resource_versions=None,
                                 interactive=False
                             )
                             print(f"Successfully triggered pipeline {trigger_result['build_id']}")
